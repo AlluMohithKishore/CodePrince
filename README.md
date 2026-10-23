@@ -8,6 +8,9 @@ Local-first, personalized DSA practice platform. It uses FastAPI + SQLite and a 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r backend/requirements.txt
+# Optional: bootstrap the first administrator (choose a strong local password)
+$env:ADMIN_EMAIL = "admin@example.local"
+$env:ADMIN_PASSWORD = "replace-with-a-strong-password"
 uvicorn app.main:app --app-dir backend --reload --port 8000
 
 cd frontend
@@ -16,6 +19,8 @@ npm run dev
 ```
 
 Open `http://localhost:5173`. The API is available at `http://localhost:8000/docs`.
+
+Students can register from the sign-in screen. Create faculty accounts and assign student registration numbers from the admin workspace. Faculty can create courses, map students by registration number, review course progress, publish assessments, review results, and share them with students. The bootstrap administrator is created only when `ADMIN_EMAIL` and `ADMIN_PASSWORD` are set when the API starts.
 
 ## Execution security
 
