@@ -1,0 +1,1 @@
+Database migrations are managed from SQLAlchemy metadata for this MVP. Run `alembic revision --autogenerate -m "change"` after configuring Alembic's env.py in deployments.

@@ -1,0 +1,11 @@
+services:
+  api:
+    build: ./backend
+    ports: ["8000:8000"]
+    volumes: ["./backend:/app"]
+    environment:
+      DATABASE_URL: sqlite:///./dsa_forge.db
+      CORS_ORIGINS: http://localhost:5173
+  web:
+    build: ./frontend
+    ports: ["5173:80"]
