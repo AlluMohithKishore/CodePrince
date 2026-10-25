@@ -21,3 +21,15 @@ def test_custom_question_and_progress():
         })
         assert r.status_code == 201
         assert c.get('/api/questions/' + r.json()['slug']).json()['tests'] == []
+
+def test_student_profile_summary_is_safe_and_public():
+    with TestClient(app) as client:
+        assert client.post('/api/auth/register', json=credentials()).status_code == 201
+        profile = client.get('/api/profile/me')
+        assert profile.status_code == 200
+        body = profile.json()
+        assert body['username'].startswith('student-')
+        assert 'email' not in body
+        public = client.get('/api/u/' + body['username'])
+        assert public.status_code == 200
+        assert public.json()['username'] == body['username']
