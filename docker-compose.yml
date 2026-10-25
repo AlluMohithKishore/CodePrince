@@ -2,6 +2,7 @@ services:
   executor:
     build: ./executor
     image: dsa-forge-executor:local
+    command: "true"
 
   api:
     build: ./backend
