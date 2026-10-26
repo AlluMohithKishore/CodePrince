@@ -212,14 +212,20 @@ def add_to_sheet(sid:int,question_id:int,u:User=Depends(current),s:Session=Depen
     if s.get(SheetQuestion,{"sheet_id":sid,"question_id":question_id}):raise HTTPException(409,"Already in sheet")
     s.add(SheetQuestion(sheet_id=sid,question_id=question_id,position=s.scalar(select(func.count()).select_from(SheetQuestion).where(SheetQuestion.sheet_id==sid))));s.commit();return {"ok":True}
 
-def _docker():
+def _docker_client():
+    if docker is None: return None
     try:
-        if docker is None: return False
-        client=docker.from_env(timeout=3)
+        client=docker.DockerClient(base_url="unix:///var/run/docker.sock", timeout=3)
         client.ping()
-        return True
-    except (docker.errors.DockerException,OSError):
-        return False
+        return client
+    except Exception as error:
+        print(f"Docker probe failed: {type(error).__name__}: {error}", flush=True)
+        return None
+def _docker():
+    client=_docker_client()
+    if client is None: return False
+    client.close()
+    return True
 def function_source(source:str, language:str, raw_input:str):
     data=json.loads(raw_input); nums=data["nums"]; target=data["target"]; values=",".join(map(str,nums))
     if language=="python": return source+f"\nimport json\nprint(json.dumps(has_pair_sum({nums!r}, {target})))\n"
@@ -228,9 +234,15 @@ def function_source(source:str, language:str, raw_input:str):
     if language=="java": return source+f"\nclass Main {{ public static void main(String[] args) {{ System.out.print(new Solution().hasPairSum(new int[]{{{values}}},{target})); }} }}\n"
     if language=="go": return source+f"\nfunc main() {{ fmt.Print(hasPairSum([]int{{{values}}}, {target})) }}\n"
     raise ValueError("Unsupported language")
-def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False):
-    if not _docker(): raise HTTPException(503,"Docker executor unavailable. Check the Docker socket and executor image.")
-    client=docker.from_env(timeout=3)
+def is_function_question(q):
+    return q.slug.endswith("-function") or "function" in q.title.lower()
+def outputs_match(actual:str,expected:str):
+    a=actual.strip(); e=expected.strip()
+    if a.lower() in {"true","false"} and e.lower() in {"true","false"}: return a.lower()==e.lower()
+    return a==e
+def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool=False):
+    client=_docker_client()
+    if client is None: raise HTTPException(503,"Docker executor unavailable. Check the Docker socket and executor image.")
     suffix={"c":"main.c","cpp":"main.cpp","java":"Main.java","python":"main.py","go":"main.go"}[body.language]
     commands={"c":"gcc /work/main.c -O2 -o /tmp/a && /tmp/a","cpp":"g++ /work/main.cpp -O2 -o /tmp/a && /tmp/a","java":"javac -d /tmp /work/Main.java && java -cp /tmp Main","python":"python3 -I /work/main.py","go":"go build -o /tmp/a /work/main.go && /tmp/a"}
     with tempfile.TemporaryDirectory() as d:
@@ -240,7 +252,7 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False):
        Path(d,"input").write_text("" if function_mode else inp,encoding="utf-8")
        container_id=None; start=time.perf_counter()
        try:
-        host_config=client.api.create_host_config(network_mode="none",readonly_rootfs=True,tmpfs={"/tmp":"rw,noexec,nosuid,size=64m"},pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"],binds=[f"{Path(d).resolve()}:/work:ro"])
+        host_config=client.api.create_host_config(network_mode="none",read_only=True,tmpfs={"/tmp":"rw,noexec,nosuid,size=64m"},pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"],binds=[f"{Path(d).resolve()}:/work:ro"])
         container_id=client.api.create_container(image=os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),command=["/bin/sh","-c",f"{commands[body.language]} < /work/input"],user="10001",host_config=host_config)["Id"]
         client.api.start(container_id)
         result=client.api.wait(container_id,timeout=8); status_code=result.get("StatusCode",1) if isinstance(result,dict) else int(result)
@@ -254,18 +266,26 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False):
        if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}
        if status_code:return {"verdict":"Compilation Error" if not stdout else "Runtime Error","output":stdout,"stderr":stderr,"runtime_ms":elapsed}
        out.append({"output":stdout,"stderr":stderr,"runtime_ms":elapsed})
-      return {"verdict":"Accepted","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}@app.post("/api/run")
+      return {"verdict":"Accepted" if verify else "Executed","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}
+@app.post("/api/run")
 def run(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     q=s.get(Question,body.question_id)
     if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
+    sample=s.scalar(select(TestCase).where(TestCase.question_id==q.id,TestCase.input==body.input,TestCase.is_hidden==False))
     inputs=[body.input] if body.input is not None else list(s.scalars(select(TestCase.input).where(TestCase.question_id==q.id,TestCase.is_hidden==False)))
-    return execute(body,inputs,q.slug=="pair-sum-function")
+    result=execute(body,inputs,is_function_question(q),False)
+    if sample and result.get("verdict")=="Executed":
+        actual=result.get("results",[{}])[0].get("output","").strip()
+        result["verdict"]="Accepted" if outputs_match(actual,sample.expected_output) else "Wrong Answer"
+    return result
 @app.post("/api/submit")
 def submit(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     q=s.get(Question,body.question_id)
     if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
-    tests=list(s.scalars(select(TestCase).where(TestCase.question_id==q.id)));result=execute(body,[t.input for t in tests],q.slug=="pair-sum-function"); verdict=result["verdict"]
-    if verdict=="Accepted" and any(r["output"].strip()!=t.expected_output.strip() for r,t in zip(result["results"],tests)):verdict="Wrong Answer"
+    tests=list(s.scalars(select(TestCase).where(TestCase.question_id==q.id)));result=execute(body,[t.input for t in tests],is_function_question(q),True); verdict=result["verdict"]
+    mismatches=[{"case":i+1,"expected":t.expected_output,"actual":r["output"]} for i,(r,t) in enumerate(zip(result["results"],tests)) if not outputs_match(r["output"],t.expected_output)]
+    if verdict=="Accepted" and mismatches: verdict="Wrong Answer"
+    if mismatches: result["mismatches"]=mismatches
     p=progress_for(s,u,q.id);p.attempts+=1;p.last_attempted=datetime.utcnow();p.solved=p.solved or verdict=="Accepted"
     if verdict=="Accepted":p.revision_due=datetime.utcnow()+timedelta(days=7)
     s.add(Submission(user_id=u.id,question_id=q.id,language=body.language,source=body.source,verdict=verdict,runtime_ms=result.get("runtime_ms",0)));s.commit();return {"verdict":verdict,"runtime_ms":result.get("runtime_ms",0),"details":result if verdict!="Accepted" else {"tests":len(tests)}}
