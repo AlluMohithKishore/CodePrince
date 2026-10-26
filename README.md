@@ -17,6 +17,17 @@ npm run dev
 
 Open `http://localhost:5173`. The API is available at `http://localhost:8000/docs`.
 
+## Docker startup
+
+Docker Desktop must be running. From the repository root:
+
+```powershell
+$env:ADMIN_EMAIL="admin@example.com"
+$env:ADMIN_PASSWORD="use-a-strong-local-password"
+docker compose up --build
+```
+
+Open `http://localhost:5173`; the API is available at `http://localhost:8000/docs`. The API container uses the Docker socket only to launch short-lived, network-disabled executor containers. The executor image is built locally as `dsa-forge-executor:local` and is never exposed as a network service.
 ## Execution security
 
 `POST /api/run` and `POST /api/submit` use a short-lived Docker container when Docker is installed. The supplied executor disables networking, drops capabilities, runs as an unprivileged user, has read-only root storage, and applies CPU/memory/process/output/time limits. Docker is not installed in this environment, so the API reports `503` instead of falling back to unsafe in-process execution.
