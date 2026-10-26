@@ -1,6 +1,10 @@
 """DSA Forge API. Private test cases never appear in serialized question data."""
 from __future__ import annotations
 import hashlib, json, os, secrets, subprocess, tempfile, time
+try:
+    import docker
+except ImportError:
+    docker = None
 from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Literal
@@ -209,8 +213,13 @@ def add_to_sheet(sid:int,question_id:int,u:User=Depends(current),s:Session=Depen
     s.add(SheetQuestion(sheet_id=sid,question_id=question_id,position=s.scalar(select(func.count()).select_from(SheetQuestion).where(SheetQuestion.sheet_id==sid))));s.commit();return {"ok":True}
 
 def _docker():
-    try:return subprocess.run(["docker","info"],capture_output=True,timeout=3).returncode==0
-    except (FileNotFoundError,subprocess.TimeoutExpired):return False
+    try:
+        if docker is None: return False
+        client=docker.from_env(timeout=3)
+        client.ping()
+        return True
+    except (docker.errors.DockerException,OSError):
+        return False
 def function_source(source:str, language:str, raw_input:str):
     data=json.loads(raw_input); nums=data["nums"]; target=data["target"]; values=",".join(map(str,nums))
     if language=="python": return source+f"\nimport json\nprint(json.dumps(has_pair_sum({nums!r}, {target})))\n"
@@ -220,19 +229,32 @@ def function_source(source:str, language:str, raw_input:str):
     if language=="go": return source+f"\nfunc main() {{ fmt.Print(hasPairSum([]int{{{values}}}, {target})) }}\n"
     raise ValueError("Unsupported language")
 def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False):
-    if not _docker():raise HTTPException(503,"Docker executor unavailable. Install and start Docker, then build executor image.")
+    if not _docker(): raise HTTPException(503,"Docker executor unavailable. Check the Docker socket and executor image.")
+    client=docker.from_env(timeout=3)
     suffix={"c":"main.c","cpp":"main.cpp","java":"Main.java","python":"main.py","go":"main.go"}[body.language]
     commands={"c":"gcc /work/main.c -O2 -o /tmp/a && /tmp/a","cpp":"g++ /work/main.cpp -O2 -o /tmp/a && /tmp/a","java":"javac -d /tmp /work/Main.java && java -cp /tmp Main","python":"python3 -I /work/main.py","go":"go build -o /tmp/a /work/main.go && /tmp/a"}
     with tempfile.TemporaryDirectory() as d:
-      Path(d,suffix).write_text(body.source,encoding="utf-8");out=[]
+      Path(d,suffix).write_text(body.source,encoding="utf-8"); out=[]
       for inp in inputs:
        Path(d,suffix).write_text(function_source(body.source,body.language,inp) if function_mode else body.source,encoding="utf-8")
-       start=time.perf_counter(); p=subprocess.run(["docker","run","--rm","--network=none","--read-only","--tmpfs","/tmp:rw,noexec,nosuid,size=64m","--pids-limit","64","--memory","256m","--cpus","1","--cap-drop=ALL","--security-opt","no-new-privileges","-v",f"{Path(d).resolve()}:/work:ro","-i",os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),commands[body.language]],input="" if function_mode else inp,text=True,capture_output=True,timeout=8);elapsed=int((time.perf_counter()-start)*1000)
-       if len(p.stdout)+len(p.stderr)>65536:return {"verdict":"Output Limit Exceeded","output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}
-       if p.returncode:return {"verdict":"Compilation Error" if not p.stdout else "Runtime Error","output":p.stdout,"stderr":p.stderr,"runtime_ms":elapsed}
-       out.append({"output":p.stdout,"stderr":p.stderr,"runtime_ms":elapsed})
-      return {"verdict":"Accepted","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}
-@app.post("/api/run")
+       Path(d,"input").write_text("" if function_mode else inp,encoding="utf-8")
+       container_id=None; start=time.perf_counter()
+       try:
+        host_config=client.api.create_host_config(network_mode="none",readonly_rootfs=True,tmpfs={"/tmp":"rw,noexec,nosuid,size=64m"},pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"],binds=[f"{Path(d).resolve()}:/work:ro"])
+        container_id=client.api.create_container(image=os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),command=["/bin/sh","-c",f"{commands[body.language]} < /work/input"],user="10001",host_config=host_config)["Id"]
+        client.api.start(container_id)
+        result=client.api.wait(container_id,timeout=8); status_code=result.get("StatusCode",1) if isinstance(result,dict) else int(result)
+        stdout=client.api.logs(container_id,stdout=True,stderr=False).decode(errors="replace"); stderr=client.api.logs(container_id,stdout=False,stderr=True).decode(errors="replace"); elapsed=int((time.perf_counter()-start)*1000)
+       except Exception as error:
+        elapsed=int((time.perf_counter()-start)*1000); return {"verdict":"Runtime Error","output":"","stderr":str(error),"runtime_ms":elapsed}
+       finally:
+        if container_id:
+         try: client.api.remove_container(container_id,force=True)
+         except docker.errors.DockerException: pass
+       if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}
+       if status_code:return {"verdict":"Compilation Error" if not stdout else "Runtime Error","output":stdout,"stderr":stderr,"runtime_ms":elapsed}
+       out.append({"output":stdout,"stderr":stderr,"runtime_ms":elapsed})
+      return {"verdict":"Accepted","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}@app.post("/api/run")
 def run(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     q=s.get(Question,body.question_id)
     if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
