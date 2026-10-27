@@ -10,7 +10,7 @@ def test_auth_and_private_tests():
         assert c.post('/api/auth/register', json=credentials()).status_code == 201
         q = c.get('/api/questions').json()['items'][0]
         detail = c.get('/api/questions/' + q['slug']).json()
-        assert len(detail['tests']) == 1
+        assert len(detail['tests']) == 5
 
 def test_custom_question_and_progress():
     with TestClient(app) as c:

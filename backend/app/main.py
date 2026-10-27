@@ -101,6 +101,32 @@ def seed():
       if not s.scalar(select(Question).where(Question.slug=="pair-sum-function")):
         fq=Question(title="Pair Sum (Function)",slug="pair-sum-function",statement="Implement `has_pair_sum(nums, target)`. Return true when two distinct values sum to target; otherwise return false. Write only the function: the judge supplies inputs and calls it.",difficulty="Easy",topic="Arrays",tags='["hashing","function-contract"]',constraints="2 <= n <= 100000",input_format="The judge calls has_pair_sum(nums, target).",output_format="Return a boolean.",hints="Track values seen so far in a set.",editorial="For each x, check whether target-x has already appeared.",starter_code=json.dumps({"python":"def has_pair_sum(nums, target):\n    # return True or False\n    pass\n","cpp":"#include <bits/stdc++.h>\nusing namespace std;\nclass Solution { public: bool hasPairSum(vector<int>& nums, int target) { return false; } };\n","c":"#include <stdbool.h>\nbool has_pair_sum(const int* nums, int n, int target) { return false; }\n","java":"import java.util.*;\nclass Solution { public boolean hasPairSum(int[] nums, int target) { return false; } }\n","go":"package main\nimport \"fmt\"\nfunc hasPairSum(nums []int, target int) bool { return false }\n"}),published=True)
         s.add(fq);s.flush();s.add_all([TestCase(question_id=fq.id,input='{"nums":[2,7,11,15],"target":9}',expected_output="true\n"),TestCase(question_id=fq.id,input='{"nums":[1,2,3],"target":10}',expected_output="false\n",is_hidden=True)]);s.commit()
+    with SessionLocal() as s:
+      fq=s.scalar(select(Question).where(Question.slug=="pair-sum-function"))
+      if fq:
+        visible_cases=[
+          ({"nums":[2,7,11,15],"target":9},"true\n"),
+          ({"nums":[3,1,4,8],"target":12},"true\n"),
+          ({"nums":[-5,12,7,20],"target":2},"true\n"),
+          ({"nums":[1,2,3,4],"target":20},"false\n"),
+          ({"nums":[0,0,5,-5],"target":0},"true\n"),
+        ]
+        hidden_cases=[]
+        for index in range(30):
+          nums=[index+3, -(index+8), 1000+index]
+          if index % 2 == 0:
+            target=nums[0]+nums[1]
+            expected="true\n"
+          else:
+            target=999999
+            expected="false\n"
+          hidden_cases.append(({"nums":nums,"target":target},expected))
+        existing={t.input for t in s.scalars(select(TestCase).where(TestCase.question_id==fq.id))}
+        for payload,expected in visible_cases+hidden_cases:
+          raw=json.dumps(payload,separators=(",",":"))
+          if raw not in existing:
+            s.add(TestCase(question_id=fq.id,input=raw,expected_output=expected,is_hidden=(payload,expected) in hidden_cases))
+        s.commit()
 @app.get("/api/health")
 def health(): return {"status":"ok","executor":"docker" if _docker() else "unavailable"}
 @app.post("/api/auth/register",status_code=201)
@@ -258,13 +284,15 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool
         result=client.api.wait(container_id,timeout=8); status_code=result.get("StatusCode",1) if isinstance(result,dict) else int(result)
         stdout=client.api.logs(container_id,stdout=True,stderr=False).decode(errors="replace"); stderr=client.api.logs(container_id,stdout=False,stderr=True).decode(errors="replace"); elapsed=int((time.perf_counter()-start)*1000)
        except Exception as error:
-        elapsed=int((time.perf_counter()-start)*1000); return {"verdict":"Runtime Error","output":"","stderr":str(error),"runtime_ms":elapsed}
+        elapsed=int((time.perf_counter()-start)*1000); out.append({"output":"","stderr":str(error),"runtime_ms":elapsed}); return {"verdict":"Runtime Error","results":out,"runtime_ms":elapsed}
        finally:
         if container_id:
          try: client.api.remove_container(container_id,force=True)
          except docker.errors.DockerException: pass
-       if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}
-       if status_code:return {"verdict":"Compilation Error" if not stdout else "Runtime Error","output":stdout,"stderr":stderr,"runtime_ms":elapsed}
+       if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","results":out+[{"output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}],"runtime_ms":elapsed}
+       if status_code:
+        case={"output":stdout,"stderr":stderr,"runtime_ms":elapsed};out.append(case)
+        return {"verdict":"Compilation Error" if not stdout else "Runtime Error","results":out,"runtime_ms":elapsed}
        out.append({"output":stdout,"stderr":stderr,"runtime_ms":elapsed})
       return {"verdict":"Accepted" if verify else "Executed","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}
 @app.post("/api/run")
@@ -283,7 +311,8 @@ def submit(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     q=s.get(Question,body.question_id)
     if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
     tests=list(s.scalars(select(TestCase).where(TestCase.question_id==q.id)));result=execute(body,[t.input for t in tests],is_function_question(q),True); verdict=result["verdict"]
-    mismatches=[{"case":i+1,"expected":t.expected_output,"actual":r["output"]} for i,(r,t) in enumerate(zip(result["results"],tests)) if not outputs_match(r["output"],t.expected_output)]
+    results=result.get("results",[])
+    mismatches=[{"case":i+1,"expected":t.expected_output,"actual":r.get("output","")} for i,(r,t) in enumerate(zip(results,tests)) if not outputs_match(r.get("output",""),t.expected_output)]
     if verdict=="Accepted" and mismatches: verdict="Wrong Answer"
     if mismatches: result["mismatches"]=mismatches
     p=progress_for(s,u,q.id);p.attempts+=1;p.last_attempted=datetime.utcnow();p.solved=p.solved or verdict=="Accepted"
