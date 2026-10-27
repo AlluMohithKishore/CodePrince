@@ -284,3 +284,212 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool
        else:
         Path(d,suffix).write_text(body.source,encoding="utf-8")
        Path(d,"input").write_text("" if function_mode else inp,encoding="utf-8")
+       container_id=None; start=time.perf_counter()
+       try:
+        host_config=client.api.create_host_config(network_mode="none",read_only=True,tmpfs={"/tmp":"rw,noexec,nosuid,size=64m"},pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"],binds=[f"{Path(d).resolve()}:/work:ro"])
+        container_id=client.api.create_container(image=os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),command=["/bin/sh","-c",f"{commands[body.language]} < /work/input"],user="10001",host_config=host_config)["Id"]
+        client.api.start(container_id)
+        result=client.api.wait(container_id,timeout=8); status_code=result.get("StatusCode",1) if isinstance(result,dict) else int(result)
+        stdout=client.api.logs(container_id,stdout=True,stderr=False).decode(errors="replace"); stderr=client.api.logs(container_id,stdout=False,stderr=True).decode(errors="replace"); elapsed=int((time.perf_counter()-start)*1000)
+       except Exception as error:
+        elapsed=int((time.perf_counter()-start)*1000); out.append({"output":"","stderr":str(error),"runtime_ms":elapsed}); return {"verdict":"Runtime Error","results":out,"runtime_ms":elapsed}
+       finally:
+        if container_id:
+         try: client.api.remove_container(container_id,force=True)
+         except docker.errors.DockerException: pass
+       if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","results":out+[{"output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}],"runtime_ms":elapsed}
+       if status_code:
+        case={"output":stdout,"stderr":stderr,"runtime_ms":elapsed};out.append(case)
+        return {"verdict":"Compilation Error" if not stdout else "Runtime Error","results":out,"runtime_ms":elapsed}
+       out.append({"output":stdout,"stderr":stderr,"runtime_ms":elapsed})
+      return {"verdict":"Accepted" if verify else "Executed","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}
+@app.post("/api/run")
+def run(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
+    q=s.get(Question,body.question_id)
+    if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
+    sample=s.scalar(select(TestCase).where(TestCase.question_id==q.id,TestCase.input==body.input,TestCase.is_hidden==False))
+    inputs=[body.input] if body.input is not None else list(s.scalars(select(TestCase.input).where(TestCase.question_id==q.id,TestCase.is_hidden==False)))
+    result=execute(body,inputs,is_function_question(q),False)
+    if sample and result.get("verdict")=="Executed":
+        actual=result.get("results",[{}])[0].get("output","").strip()
+        result["verdict"]="Accepted" if outputs_match(actual,sample.expected_output) else "Wrong Answer"
+    return result
+@app.post("/api/submit")
+def submit(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
+    q=s.get(Question,body.question_id)
+    if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
+    tests=list(s.scalars(select(TestCase).where(TestCase.question_id==q.id)));result=execute(body,[t.input for t in tests],is_function_question(q),True); verdict=result["verdict"]
+    results=result.get("results",[])
+    mismatches=[{"case":i+1,"expected":t.expected_output,"actual":r.get("output","")} for i,(r,t) in enumerate(zip(results,tests)) if not outputs_match(r.get("output",""),t.expected_output)]
+    if verdict=="Accepted" and mismatches: verdict="Wrong Answer"
+    if mismatches: result["mismatches"]=mismatches
+    p=progress_for(s,u,q.id);p.attempts+=1;p.last_attempted=datetime.utcnow();p.solved=p.solved or verdict=="Accepted"
+    if verdict=="Accepted":p.revision_due=datetime.utcnow()+timedelta(days=7)
+    s.add(Submission(user_id=u.id,question_id=q.id,language=body.language,source=body.source,verdict=verdict,runtime_ms=result.get("runtime_ms",0)));s.commit();return {"verdict":verdict,"runtime_ms":result.get("runtime_ms",0),"details":result if verdict!="Accepted" else {"tests":len(tests)}}
+@app.get("/api/submissions")
+def submissions(u:User=Depends(current),s:Session=Depends(db)):return [{"id":x.id,"question_id":x.question_id,"language":x.language,"verdict":x.verdict,"runtime_ms":x.runtime_ms,"created_at":x.created_at} for x in s.scalars(select(Submission).where(Submission.user_id==u.id).order_by(Submission.id.desc()).limit(100))]
+@app.get("/api/submissions/{sid}")
+def submission(sid:int,u:User=Depends(current),s:Session=Depends(db)):
+    x=s.get(Submission,sid)
+    if not x or x.user_id!=u.id:raise HTTPException(404,"Submission not found")
+    return {"id":x.id,"question_id":x.question_id,"language":x.language,"source":x.source,"verdict":x.verdict,"runtime_ms":x.runtime_ms,"created_at":x.created_at}
+
+@app.patch("/api/progress/questions/{qid}")
+def update_progress(qid:int,body:ProgressIn,u:User=Depends(current),s:Session=Depends(db)):
+    if not s.get(Question,qid):raise HTTPException(404,"Question not found")
+    p=progress_for(s,u,qid)
+    for k,v in body.model_dump(exclude_none=True).items():setattr(p,k,v)
+    s.commit();return {"solved":p.solved,"bookmarked":p.bookmarked,"notes":p.notes,"confidence":p.confidence,"revision_due":p.revision_due}
+@app.get("/api/progress/overview")
+def overview(u:User=Depends(current),s:Session=Depends(db)):
+    ps=list(s.scalars(select(Progress).where(Progress.user_id==u.id)));subs=list(s.scalars(select(Submission).where(Submission.user_id==u.id)))
+    days={x.created_at.date() for x in subs};streak=0;d=date.today()
+    while d in days:streak+=1;d-=timedelta(days=1)
+    return {"solved":sum(x.solved for x in ps),"attempted":len(ps),"bookmarked":sum(x.bookmarked for x in ps),"current_streak":streak,"submissions":len(subs),"activity":[{"date":str(d),"count":sum(x.created_at.date()==d for x in subs)} for d in sorted(days)]}
+@app.get("/api/progress/topics")
+def topics(u:User=Depends(current),s:Session=Depends(db)):
+    qs=list(s.scalars(select(Question).where((Question.published==True)|(Question.owner_id==u.id))));res={}
+    for q in qs:
+      p=s.scalar(select(Progress).where(Progress.user_id==u.id,Progress.question_id==q.id));r=res.setdefault(q.topic,{"topic":q.topic,"total":0,"solved":0});r["total"]+=1;r["solved"]+=bool(p and p.solved)
+    return list(res.values())
+@app.get("/api/revision-queue")
+def revision(u:User=Depends(current),s:Session=Depends(db)):return [visible(s.get(Question,p.question_id),s) for p in s.scalars(select(Progress).where(Progress.user_id==u.id,Progress.revision_due<=datetime.utcnow(),Progress.solved==True))]
+@app.get("/api/export")
+def export(u:User=Depends(current),s:Session=Depends(db)):return {"version":1,"questions":[visible(q,s) for q in s.scalars(select(Question).where(Question.owner_id==u.id))]}
+@app.post("/api/import")
+def import_data(payload:dict,u:User=Depends(current),s:Session=Depends(db)):
+    if payload.get("version")!=1 or not isinstance(payload.get("questions"),list):raise HTTPException(422,"Expected version 1 question export")
+    count=0
+    for raw in payload["questions"]:
+      try: save_question(None,QuestionIn.model_validate(raw),u,s);count+=1
+      except Exception as e: raise HTTPException(422,f"Invalid question import: {e}")
+    return {"imported":count}
+
+# Academic role APIs
+def require_role(user: User, *roles: str):
+    if user.role not in roles: raise HTTPException(403, "This action is not permitted for your account role")
+def course_view(course: Course): return {"id":course.id,"title":course.title,"code":course.code,"description":course.description,"faculty_id":course.faculty_id,"active":course.active}
+class AccountIn(Credentials): role: Literal["admin","faculty","student"]="student"
+class CourseIn(BaseModel): title: str=Field(min_length=2,max_length=160); code: str=Field(min_length=2,max_length=40); description: str=""; faculty_id: int|None=None
+class AssessmentIn(BaseModel): course_id:int; title:str=Field(min_length=2,max_length=160); description:str=""; starts_at:datetime|None=None; ends_at:datetime|None=None; question_ids:list[int]=[]
+
+@app.post("/api/admin/users",status_code=201)
+def admin_create_user(body:AccountIn,u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"admin")
+    if s.scalar(select(User).where(User.email==body.email.lower())): raise HTTPException(409,"Email already registered")
+    if body.registration_number and s.scalar(select(User).where(User.registration_number==body.registration_number)): raise HTTPException(409,"Registration number already registered")
+    x=User(email=body.email.lower(),password_hash=password_hash.hash(body.password),role=body.role,registration_number=body.registration_number);s.add(x);s.commit();return {"id":x.id,"email":x.email,"role":x.role,"registration_number":x.registration_number}
+@app.get("/api/admin/users")
+def admin_users(u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"admin");return [{"id":x.id,"email":x.email,"role":x.role,"registration_number":x.registration_number} for x in s.scalars(select(User).order_by(User.id))]
+@app.get("/api/admin/statistics")
+def admin_statistics(u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"admin");return {"users":{r:s.scalar(select(func.count()).select_from(User).where(User.role==r)) for r in ("admin","faculty","student")},"courses":s.scalar(select(func.count()).select_from(Course)),"assessments":s.scalar(select(func.count()).select_from(Assessment)),"submissions":s.scalar(select(func.count()).select_from(Submission)),"problems":s.scalar(select(func.count()).select_from(Question))}
+@app.get("/api/admin/analytics")
+def admin_analytics(u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"admin")
+    submissions=list(s.scalars(select(Submission).order_by(Submission.created_at)).all())
+    users=list(s.scalars(select(User).order_by(User.created_at)).all())
+    days={}
+    for item in submissions:
+        key=item.created_at.date().isoformat()
+        bucket=days.setdefault(key,{"date":key,"accepted":0,"wrong":0,"runtime":0,"compile":0})
+        verdict=item.verdict.lower()
+        bucket["accepted" if verdict=="accepted" else "wrong" if "wrong" in verdict else "runtime" if "runtime" in verdict else "compile"]+=1
+    growth={}
+    for item in users:
+        key=item.created_at.strftime("%Y-%m")
+        growth[key]=growth.get(key,0)+1
+    return {"submissions":list(days.values())[-30:],"user_growth":[{"month":key,"value":value} for key,value in sorted(growth.items())]}
+@app.post("/api/courses",status_code=201)
+def create_course(body:CourseIn,u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"admin","faculty")
+    faculty_id=body.faculty_id if u.role=="admin" else u.id
+    if faculty_id and (not s.get(User,faculty_id) or s.get(User,faculty_id).role!="faculty"): raise HTTPException(422,"faculty_id must identify a faculty account")
+    if s.scalar(select(Course).where(Course.code==body.code.upper())): raise HTTPException(409,"Course code already exists")
+    c=Course(title=body.title,code=body.code.upper(),description=body.description,faculty_id=faculty_id);s.add(c);s.commit();return course_view(c)
+@app.get("/api/courses")
+def list_courses(u:User=Depends(current),s:Session=Depends(db)):
+    if u.role=="admin": rows=s.scalars(select(Course)).all()
+    elif u.role=="faculty": rows=s.scalars(select(Course).where(Course.faculty_id==u.id)).all()
+    else: rows=s.scalars(select(Course).join(Enrollment,Enrollment.course_id==Course.id).where(Enrollment.student_id==u.id)).all()
+    return [course_view(c) for c in rows]
+@app.post("/api/courses/{course_id}/students",status_code=201)
+def map_student(course_id:int,registration_number:str,u:User=Depends(current),s:Session=Depends(db)):
+    c=s.get(Course,course_id)
+    if not c: raise HTTPException(404,"Course not found")
+    if u.role=="faculty" and c.faculty_id!=u.id: raise HTTPException(403,"Not your course")
+    require_role(u,"admin","faculty")
+    student=s.scalar(select(User).where(User.registration_number==registration_number,User.role=="student"))
+    if not student: raise HTTPException(404,"Student registration number not found")
+    if s.scalar(select(Enrollment).where(Enrollment.course_id==course_id,Enrollment.student_id==student.id)): raise HTTPException(409,"Student is already mapped")
+    s.add(Enrollment(course_id=course_id,student_id=student.id,faculty_id=c.faculty_id));s.commit();return {"course_id":course_id,"student_id":student.id}
+@app.post("/api/courses/{course_id}/questions",status_code=201)
+def add_course_question(course_id:int,question_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    c=s.get(Course,course_id)
+    if not c or (u.role=="faculty" and c.faculty_id!=u.id): raise HTTPException(404,"Course not found")
+    require_role(u,"admin","faculty")
+    if not s.get(Question,question_id): raise HTTPException(404,"Question not found")
+    if s.get(CourseQuestion,{"course_id":course_id,"question_id":question_id}): raise HTTPException(409,"Question already mapped")
+    s.add(CourseQuestion(course_id=course_id,question_id=question_id,position=s.scalar(select(func.count()).select_from(CourseQuestion).where(CourseQuestion.course_id==course_id))));s.commit();return {"ok":True}
+@app.get("/api/courses/{course_id}/progress")
+def course_progress(course_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    c=s.get(Course,course_id)
+    if not c: raise HTTPException(404,"Course not found")
+    enrolled=s.scalar(select(Enrollment).where(Enrollment.course_id==course_id,Enrollment.student_id==u.id))
+    if u.role=="student" and not enrolled: raise HTTPException(403,"Not enrolled in this course")
+    qids=list(s.scalars(select(CourseQuestion.question_id).where(CourseQuestion.course_id==course_id))); students=[u.id] if u.role=="student" else list(s.scalars(select(Enrollment.student_id).where(Enrollment.course_id==course_id)))
+    return [{"student_id":sid,"solved":s.scalar(select(func.count()).select_from(Progress).where(Progress.user_id==sid,Progress.question_id.in_(qids),Progress.solved==True)) or 0,"total":len(qids)} for sid in students]
+@app.post("/api/assessments",status_code=201)
+def create_assessment(body:AssessmentIn,u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"faculty");c=s.get(Course,body.course_id)
+    if not c or c.faculty_id!=u.id: raise HTTPException(404,"Course not found")
+    a=Assessment(course_id=c.id,faculty_id=u.id,title=body.title,description=body.description,starts_at=body.starts_at,ends_at=body.ends_at);s.add(a);s.flush()
+    for qid in body.question_ids:
+      if not s.get(Question,qid): raise HTTPException(422,"Unknown question")
+      s.add(AssessmentQuestion(assessment_id=a.id,question_id=qid))
+    s.commit();return {"id":a.id,"title":a.title,"published":a.published}
+@app.patch("/api/assessments/{assessment_id}/publish")
+def publish_assessment(assessment_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    a=s.get(Assessment,assessment_id)
+    if not a or a.faculty_id!=u.id: raise HTTPException(404,"Assessment not found")
+    require_role(u,"faculty");a.published=True;s.commit();return {"id":a.id,"published":True}
+@app.get("/api/assessments")
+def assessments(u:User=Depends(current),s:Session=Depends(db)):
+    if u.role=="faculty": rows=s.scalars(select(Assessment).where(Assessment.faculty_id==u.id)).all()
+    elif u.role=="student": rows=s.scalars(select(Assessment).join(Enrollment,Enrollment.course_id==Assessment.course_id).where(Enrollment.student_id==u.id,Assessment.published==True)).all()
+    else: rows=s.scalars(select(Assessment)).all()
+    return [{"id":a.id,"course_id":a.course_id,"title":a.title,"description":a.description,"starts_at":a.starts_at,"ends_at":a.ends_at,"published":a.published} for a in rows]
+@app.post("/api/assessments/{assessment_id}/submit",status_code=201)
+def submit_assessment(assessment_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    require_role(u,"student");a=s.get(Assessment,assessment_id)
+    if not a or not a.published: raise HTTPException(404,"Assessment not found")
+    if not s.scalar(select(Enrollment).where(Enrollment.course_id==a.course_id,Enrollment.student_id==u.id)): raise HTTPException(403,"Not enrolled")
+    qids=list(s.scalars(select(AssessmentQuestion.question_id).where(AssessmentQuestion.assessment_id==a.id))); score=s.scalar(select(func.count()).select_from(Progress).where(Progress.user_id==u.id,Progress.question_id.in_(qids),Progress.solved==True)) or 0
+    attempt=s.scalar(select(AssessmentAttempt).where(AssessmentAttempt.assessment_id==a.id,AssessmentAttempt.student_id==u.id)) or AssessmentAttempt(assessment_id=a.id,student_id=u.id)
+    attempt.score=score;attempt.submitted_at=datetime.utcnow();s.add(attempt);s.commit();return {"assessment_id":a.id,"score":score,"out_of":len(qids)}
+@app.get("/api/assessments/{assessment_id}/results")
+def assessment_results(assessment_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    a=s.get(Assessment,assessment_id)
+    if not a: raise HTTPException(404,"Assessment not found")
+    if u.role=="faculty" and a.faculty_id!=u.id: raise HTTPException(403,"Not your assessment")
+    if u.role=="student":
+      x=s.scalar(select(AssessmentAttempt).where(AssessmentAttempt.assessment_id==a.id,AssessmentAttempt.student_id==u.id))
+      if not x or not x.shared: raise HTTPException(403,"Results are not shared yet")
+      return {"score":x.score,"submitted_at":x.submitted_at}
+    require_role(u,"admin","faculty");return [{"student_id":x.student_id,"score":x.score,"submitted_at":x.submitted_at,"shared":x.shared} for x in s.scalars(select(AssessmentAttempt).where(AssessmentAttempt.assessment_id==a.id))]
+@app.patch("/api/assessments/{assessment_id}/share-results")
+def share_results(assessment_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    a=s.get(Assessment,assessment_id)
+    if not a or a.faculty_id!=u.id: raise HTTPException(404,"Assessment not found")
+    require_role(u,"faculty");s.query(AssessmentAttempt).filter(AssessmentAttempt.assessment_id==a.id).update({AssessmentAttempt.shared:True});s.commit();return {"shared":True}
+@app.get("/api/courses/{course_id}/leaderboard")
+def leaderboard(course_id:int,u:User=Depends(current),s:Session=Depends(db)):
+    if u.role=="student" and not s.scalar(select(Enrollment).where(Enrollment.course_id==course_id,Enrollment.student_id==u.id)): raise HTTPException(403,"Not enrolled")
+    rows=course_progress(course_id,u,s);return sorted(rows,key=lambda x:x["solved"],reverse=True)
+
+@app.post("/api/admin/problems", status_code=201)
+def admin_create_problem(body: QuestionIn, u: User = Depends(current), s: Session = Depends(db)):
+    """Create a published platform problem; enforced independently of the UI."""
+    require_role(u, "admin")
+    return save_question(None, body, u, s)
