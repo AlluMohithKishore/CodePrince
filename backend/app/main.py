@@ -277,7 +277,7 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool
        if function_mode and body.language=="python":
         Path(d,"solution.py").write_text(body.source,encoding="utf-8")
         data=json.loads(inp)
-        runner=f"import json\nfrom solution import has_pair_sum\nprint(json.dumps(has_pair_sum({data['nums']!r}, {data['target']})))\n"
+        runner=f"import json\nnamespace={{}}\nexec(compile(open(\"/work/solution.py\", encoding=\"utf-8\").read(), \"solution.py\", \"exec\"), namespace)\nprint(json.dumps(namespace[\"has_pair_sum\"]({data['nums']!r}, {data['target']})))\n"
         Path(d,"main.py").write_text(runner,encoding="utf-8")
        elif function_mode:
         Path(d,suffix).write_text(function_source(body.source,body.language,inp),encoding="utf-8")
