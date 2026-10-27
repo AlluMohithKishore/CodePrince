@@ -1,6 +1,6 @@
 """DSA Forge API. Private test cases never appear in serialized question data."""
 from __future__ import annotations
-import hashlib, json, os, secrets, subprocess, tempfile, time
+import hashlib, io, json, os, secrets, subprocess, tarfile, tempfile, time
 try:
     import docker
 except ImportError:
@@ -266,18 +266,33 @@ def outputs_match(actual:str,expected:str):
     a=actual.strip(); e=expected.strip()
     if a.lower() in {"true","false"} and e.lower() in {"true","false"}: return a.lower()==e.lower()
     return a==e
+def split_docker_logs(raw: bytes):
+    if not raw:
+        return b"", b""
+    stdout_parts=[]; stderr_parts=[]; offset=0
+    while offset+8 <= len(raw) and raw[offset] in (0,1,2):
+        size=int.from_bytes(raw[offset+4:offset+8],"big")
+        end=offset+8+size
+        if end > len(raw):
+            break
+        (stdout_parts if raw[offset]==1 else stderr_parts).append(raw[offset+8:end])
+        offset=end
+    if offset != len(raw):
+        stdout_parts.append(raw[offset:])
+    return b"".join(stdout_parts), b"".join(stderr_parts)
+
 def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool=False):
     client=_docker_client()
     if client is None: raise HTTPException(503,"Docker executor unavailable. Check the Docker socket and executor image.")
     suffix={"c":"main.c","cpp":"main.cpp","java":"Main.java","python":"main.py","go":"main.go"}[body.language]
-    commands={"c":"gcc /work/main.c -O2 -o /tmp/a && /tmp/a","cpp":"g++ /work/main.cpp -O2 -o /tmp/a && /tmp/a","java":"javac -d /tmp /work/Main.java && java -cp /tmp Main","python":"python3 -I /work/main.py","go":"go build -o /tmp/a /work/main.go && /tmp/a"}
+    commands={"c":"gcc /tmp/main.c -O2 -o /tmp/a && /tmp/a","cpp":"g++ /tmp/main.cpp -O2 -o /tmp/a && /tmp/a","java":"javac -d /tmp /tmp/Main.java && java -cp /tmp Main","python":"python3 -I /tmp/main.py","go":"go build -o /tmp/a /tmp/main.go && /tmp/a"}
     with tempfile.TemporaryDirectory() as d:
       Path(d,suffix).write_text(body.source,encoding="utf-8"); out=[]
       for inp in inputs:
        if function_mode and body.language=="python":
         Path(d,"solution.py").write_text(body.source,encoding="utf-8")
         data=json.loads(inp)
-        runner=f"import json\nnamespace={{}}\nexec(compile(open(\"/work/solution.py\", encoding=\"utf-8\").read(), \"solution.py\", \"exec\"), namespace)\nprint(json.dumps(namespace[\"has_pair_sum\"]({data['nums']!r}, {data['target']})))\n"
+        runner=f"import json\nnamespace={{}}\nexec(compile(open(\"/tmp/solution.py\", encoding=\"utf-8\").read(), \"solution.py\", \"exec\"), namespace)\nprint(json.dumps(namespace[\"has_pair_sum\"]({data['nums']!r}, {data['target']})))\n"
         Path(d,"main.py").write_text(runner,encoding="utf-8")
        elif function_mode:
         Path(d,suffix).write_text(function_source(body.source,body.language,inp),encoding="utf-8")
@@ -286,11 +301,17 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool
        Path(d,"input").write_text("" if function_mode else inp,encoding="utf-8")
        container_id=None; start=time.perf_counter()
        try:
-        host_config=client.api.create_host_config(network_mode="none",read_only=True,tmpfs={"/tmp":"rw,noexec,nosuid,size=64m"},pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"],binds=[f"{Path(d).resolve()}:/work:ro"])
-        container_id=client.api.create_container(image=os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),command=["/bin/sh","-c",f"{commands[body.language]} < /work/input"],user="10001",host_config=host_config)["Id"]
+        host_config=client.api.create_host_config(network_mode="none",read_only=False,pids_limit=64,mem_limit="256m",nano_cpus=1_000_000_000,cap_drop=["ALL"],security_opt=["no-new-privileges"])
+        container_id=client.api.create_container(image=os.getenv("EXECUTOR_IMAGE","dsa-forge-executor:local"),command=["/bin/sh","-c",f"{commands[body.language]} < /tmp/input"],user="10001",host_config=host_config)["Id"]
+        archive=io.BytesIO()
+        with tarfile.open(fileobj=archive,mode="w") as bundle:
+         for item in Path(d).iterdir(): bundle.add(item,arcname=item.name)
+        client.api.put_archive(container_id,"/tmp",archive.getvalue())
         client.api.start(container_id)
         result=client.api.wait(container_id,timeout=8); status_code=result.get("StatusCode",1) if isinstance(result,dict) else int(result)
-        stdout=client.api.logs(container_id,stdout=True,stderr=False).decode(errors="replace"); stderr=client.api.logs(container_id,stdout=False,stderr=True).decode(errors="replace"); elapsed=int((time.perf_counter()-start)*1000)
+        raw_logs=client.api.logs(container_id,stdout=True,stderr=True)
+        stdout_bytes,stderr_bytes=split_docker_logs(raw_logs)
+        stdout=stdout_bytes.decode(errors="replace"); stderr=stderr_bytes.decode(errors="replace"); elapsed=int((time.perf_counter()-start)*1000)
        except Exception as error:
         elapsed=int((time.perf_counter()-start)*1000); out.append({"output":"","stderr":str(error),"runtime_ms":elapsed}); return {"verdict":"Runtime Error","results":out,"runtime_ms":elapsed}
        finally:
@@ -300,7 +321,8 @@ def execute(body:ExecuteIn,inputs:list[str],function_mode:bool=False,verify:bool
        if len(stdout)+len(stderr)>65536:return {"verdict":"Output Limit Exceeded","results":out+[{"output":"","stderr":"Output exceeded 64KB","runtime_ms":elapsed}],"runtime_ms":elapsed}
        if status_code:
         case={"output":stdout,"stderr":stderr,"runtime_ms":elapsed};out.append(case)
-        return {"verdict":"Compilation Error" if not stdout else "Runtime Error","results":out,"runtime_ms":elapsed}
+        compile_failure=body.language != "python" and ("error:" in stderr.lower() or "fatal" in stderr.lower() or "cannot find symbol" in stderr.lower())
+        return {"verdict":"Compilation Error" if compile_failure else "Runtime Error","results":out,"runtime_ms":elapsed}
        out.append({"output":stdout,"stderr":stderr,"runtime_ms":elapsed})
       return {"verdict":"Accepted" if verify else "Executed","results":out,"runtime_ms":max((x["runtime_ms"] for x in out),default=0)}
 @app.post("/api/run")
@@ -312,7 +334,10 @@ def run(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     result=execute(body,inputs,is_function_question(q),False)
     if sample and result.get("verdict")=="Executed":
         actual=result.get("results",[{}])[0].get("output","").strip()
-        result["verdict"]="Accepted" if outputs_match(actual,sample.expected_output) else "Wrong Answer"
+        passed=outputs_match(actual,sample.expected_output)
+        result["verdict"]="Accepted" if passed else "Wrong Answer"
+        if result.get("results"):
+            result["results"][0].update({"passed":passed,"input":sample.input,"expected":sample.expected_output})
     return result
 @app.post("/api/submit")
 def submit(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
@@ -320,12 +345,17 @@ def submit(body:ExecuteIn,u:User=Depends(current),s:Session=Depends(db)):
     if not q or not(q.published or owned(q,u)):raise HTTPException(404,"Question not found")
     tests=list(s.scalars(select(TestCase).where(TestCase.question_id==q.id)));result=execute(body,[t.input for t in tests],is_function_question(q),True); verdict=result["verdict"]
     results=result.get("results",[])
-    mismatches=[{"case":i+1,"expected":t.expected_output,"actual":r.get("output","")} for i,(r,t) in enumerate(zip(results,tests)) if not outputs_match(r.get("output",""),t.expected_output)]
+    mismatches=[]; case_results=[]
+    for i,(r,t) in enumerate(zip(results,tests)):
+        passed=outputs_match(r.get("output",""),t.expected_output)
+        case_results.append({"case":i+1,"passed":passed,"runtime_ms":r.get("runtime_ms",0),"input":t.input if not t.is_hidden else None,"output":r.get("output","") if not t.is_hidden else None,"expected":t.expected_output if not t.is_hidden else None,"stderr":r.get("stderr","")})
+        if not passed: mismatches.append({"case":i+1,"expected":t.expected_output if not t.is_hidden else "hidden","actual":r.get("output","") if not t.is_hidden else "hidden"})
     if verdict=="Accepted" and mismatches: verdict="Wrong Answer"
     if mismatches: result["mismatches"]=mismatches
+    result["results"]=case_results
     p=progress_for(s,u,q.id);p.attempts+=1;p.last_attempted=datetime.utcnow();p.solved=p.solved or verdict=="Accepted"
     if verdict=="Accepted":p.revision_due=datetime.utcnow()+timedelta(days=7)
-    s.add(Submission(user_id=u.id,question_id=q.id,language=body.language,source=body.source,verdict=verdict,runtime_ms=result.get("runtime_ms",0)));s.commit();return {"verdict":verdict,"runtime_ms":result.get("runtime_ms",0),"details":result if verdict!="Accepted" else {"tests":len(tests)}}
+    s.add(Submission(user_id=u.id,question_id=q.id,language=body.language,source=body.source,verdict=verdict,runtime_ms=result.get("runtime_ms",0)));s.commit();return {"verdict":verdict,"runtime_ms":result.get("runtime_ms",0),"details":result}
 @app.get("/api/submissions")
 def submissions(u:User=Depends(current),s:Session=Depends(db)):return [{"id":x.id,"question_id":x.question_id,"language":x.language,"verdict":x.verdict,"runtime_ms":x.runtime_ms,"created_at":x.created_at} for x in s.scalars(select(Submission).where(Submission.user_id==u.id).order_by(Submission.id.desc()).limit(100))]
 @app.get("/api/submissions/{sid}")
